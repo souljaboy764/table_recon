@@ -51,7 +51,7 @@ include_directories(
 )
 
 #set(CMAKE_CXX_FLAGS "-std=c++11")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O1")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O1 -g")
 
 ## Declare a C++ executable
 add_executable(object_cloud_node src/main_object_cloud.cc src/ObjectCloudNode.cpp)

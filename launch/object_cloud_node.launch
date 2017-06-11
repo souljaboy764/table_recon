@@ -1,13 +1,15 @@
 <launch>
-  <node pkg="table_recon" type="object_cloud_node" name="object_cloud_node" output="screen" required="true" />
-  
+  <node pkg="table_recon" type="object_cloud_node" name="object_cloud_node" output="screen" required="true" 
+  	/>
 
+<!--   <node name="Helper" pkg="table_recon" type="Helper.py" output="screen" />   -->
+<!-- 
   <node pkg="image_view" type="image_view" name="image_view_rgb" respawn="true" output="log">
     <remap from="/image" to="/object_depth" />
   </node>
 
   <node pkg="image_view" type="image_view" name="image_view_depth" respawn="true" output="log">
     <remap from="/image" to="/object_img" />
-  </node>
+  </node> -->
 
 </launch>

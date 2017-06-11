@@ -1,6 +1,7 @@
 #include <vector>
 #include <utility>
 #include <map>
+#include <string>
 //#include <tuple>
 
 #include <tf/transform_datatypes.h>
@@ -49,6 +50,8 @@ private:
 	static pthread_mutex_t cameraInfo_mutex;
 	static pthread_mutex_t depthImg_mutex;
 	static pthread_mutex_t rgbImg_mutex;
+	static pthread_mutex_t objects_mutex;
+	static pthread_mutex_t mapData_mutex;
 	
 	nav_msgs::OdometryPtr visualOdomPtr;
 	pcl::PointCloud<pcl::PointXYZRGB> pixelCloud, voxelCloud, objectCloud;
@@ -56,6 +59,7 @@ private:
 	pcl::PointXYZRGB minPoint, maxPoint;
 	sensor_msgs::CameraInfo cameraInfo;
 	sensor_msgs::Image depthImg, rgbImg;
+	sensor_msgs::PointCloud2 worldCloud, emptyCloud, currCloud;
 	//cv_bridge::CvImagePtr depthPtr_, rgbPtr_;
 	//tf::StampedTransform worldTF;
  	//sensor_msgs::PointCloud2 pc;
@@ -64,7 +68,8 @@ private:
 	int num_nodes;
 	ros::ServiceClient imageDetectionClient;
 	map<long unsigned int, pair<vector<unsigned char>, vector<unsigned char> > > kfObjectImages;
-	map<long unsigned int, pair<vector<unsigned char>, vector<unsigned char> > >::iterator it;
+	map<long unsigned int, sensor_msgs::PointCloud2> kfObjectPoints;
+	map<long unsigned int, sensor_msgs::PointCloud2>::iterator it;
 	vector<long unsigned int> prevKfIDs, currKfIDs;
 
 	//tf::TransformListener tfListener;
@@ -77,8 +82,9 @@ private:
 	void rgbImgCb(const sensor_msgs::ImagePtr rgbImgPtr);	
 	void detectionWindowCb(const darknet_ros::DetectedObjectsPtr objectsPtr);
 	void mapDataCb(rtabmap_ros::MapDataPtr mapDataPtr);
-	//PcII
-	pcl::PointCloud<pcl::PointXYZRGB> detectedImage(geometry_msgs::Pose pose, darknet_ros::DetectedObjects detections,pcl::PointCloud<pcl::PointXYZRGB> points);
+	sensor_msgs::PointCloud2::Ptr detectedImage(darknet_ros::DetectedObjects detections, sensor_msgs::Image depth, sensor_msgs::Image rgb);
+	sensor_msgs::PointCloud2 detectedImage(darknet_ros::DetectedObjects detections, sensor_msgs::Image depth, sensor_msgs::Image rgb, geometry_msgs::Pose pose);
+
 	//pair<vector<unsigned char>, vector<unsigned char> > detectedImage(darknet_ros::DetectedObjects detections, sensor_msgs::Image depth, sensor_msgs::Image rgb);
 	template<typename T>
 	void convert(sensor_msgs::ImagePtr depth_msg,
@@ -87,6 +93,9 @@ private:
 	
 	template<typename T>
 	vector<T> set_diff(vector<T> v1, vector<T> v2);
+
+protected:
+	static const string WORLD_FRAME;
 
 public:
 	ObjectCloudNode();

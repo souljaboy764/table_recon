@@ -20,7 +20,7 @@
 #include <image_geometry/pinhole_camera_model.h>
 #include <depth_image_proc/depth_conversions.h>
 #include <depth_image_proc/depth_traits.h>
-
+#include <pcl_ros/transforms.h>
 #include <opencv/cv.h>
 
 
@@ -31,6 +31,9 @@ pthread_mutex_t ObjectCloudNode::pointCloud_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t ObjectCloudNode::cameraInfo_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t ObjectCloudNode::depthImg_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t ObjectCloudNode::rgbImg_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t ObjectCloudNode::objects_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t ObjectCloudNode::mapData_mutex = PTHREAD_MUTEX_INITIALIZER;
+const string ObjectCloudNode::WORLD_FRAME = string("/map");
 
 ObjectCloudNode::ObjectCloudNode()
 {
@@ -39,24 +42,39 @@ ObjectCloudNode::ObjectCloudNode()
 	objectCloud_pub = nh.advertise<sensor_msgs::PointCloud2>("/object_pc",1);
 	objectDepth_pub = nh.advertise<sensor_msgs::Image>("/object_depth",1);
 	objectImg_pub = nh.advertise<sensor_msgs::Image>("/object_img",1);
-	//cout<<"init"<<endl;
+	cout<<"init"<<endl;
 	visualOdomPtr = nav_msgs::OdometryPtr();
 	num_nodes = 0;
 	objectCloud.width = 1;
 	imageDetectionClient = nh.serviceClient<darknet_ros::ImageDetection>("/darknet_ros/detect_objects");
 	
-	objectCloud2.header.seq=0;
-	objectCloud2.header.frame_id = "map";
-	pcl_conversions::toPCL(ros::Time::now(), objectCloud2.header.stamp);
+	emptyCloud.header.seq = 0;
+	emptyCloud.header.stamp = ros::Time::now();
+	emptyCloud.header.frame_id = WORLD_FRAME;
+	emptyCloud.width = 1;
+	emptyCloud.height = 0;
+	emptyCloud.is_dense = false;
+	emptyCloud.is_bigendian = false;
+	sensor_msgs::PointCloud2Modifier pcd_modifier(emptyCloud);
+	pcd_modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
+	emptyCloud.data = vector<uint8_t>();
 
-	//cout<<"init done"<<endl;
+	worldCloud = sensor_msgs::PointCloud2(emptyCloud);
+	worldCloud.header.seq = 0;
+
+	/*objectCloud2.header.seq=0;
+	objectCloud2.header.frame_id = "map";
+	pcl_conversions::toPCL(ros::Time::now(), objectCloud2.header.stamp);*/
+
+
+	cout<<"init done"<<endl;
 	visualOdom_sub = nh.subscribe("/rtabmap/odom",100, &ObjectCloudNode::visualOdomCb, this);
 	pointCloud_sub = nh.subscribe("/camera/depth_registered/points", 100, &ObjectCloudNode::pointCloudCb, this);
 	depthImg_sub = nh.subscribe("/camera/depth_registered/image_raw", 100, &ObjectCloudNode::depthImgCb, this);
 	rgbImg_sub = nh.subscribe("/camera/rgb/image_rect_color", 100, &ObjectCloudNode::rgbImgCb, this);
 	cameraInfo_sub = nh.subscribe("/camera/rgb/camera_info", 100, &ObjectCloudNode::cameraInfoCb, this);
 	detectionWindow_sub = nh.subscribe("/darknet_ros/detected_objects", 100, &ObjectCloudNode::detectionWindowCb, this);
-	mapData_sub = nh.subscribe("/rtabmap/mapData", 100, &ObjectCloudNode::mapDataCb, this);
+	//mapData_sub = nh.subscribe("/rtabmap/mapData", 100, &ObjectCloudNode::mapDataCb, this);
 }
 
 ObjectCloudNode::~ObjectCloudNode()
@@ -123,8 +141,7 @@ void ObjectCloudNode::convert(sensor_msgs::ImagePtr depth_msg,
 	// Use correct principal point from calibration
 	float center_x = cameraInfo.K[2];
 	float center_y = cameraInfo.K[5];
-	cout<<"Offsets "<<red_offset<<" "<<blue_offset<<" "<<green_offset<<" "<<color_step<<endl;
-
+	
 	// Combine unit conversion (if necessary) with scaling by focal length for computing (X,Y)
 	double unit_scaling = depth_image_proc::DepthTraits<T>::toMeters( T(1) );
 	float constant_x = unit_scaling / cameraInfo.K[0];
@@ -142,10 +159,9 @@ void ObjectCloudNode::convert(sensor_msgs::ImagePtr depth_msg,
 	sensor_msgs::PointCloud2Iterator<uint8_t> iter_r(*cloud_msg, "r");
 	sensor_msgs::PointCloud2Iterator<uint8_t> iter_g(*cloud_msg, "g");
 	sensor_msgs::PointCloud2Iterator<uint8_t> iter_b(*cloud_msg, "b");
-	sensor_msgs::PointCloud2Iterator<uint8_t> iter_a(*cloud_msg, "a");
 
 	for (int v = 0; v < int(cloud_msg->height); ++v, depth_row += row_step, rgb += rgb_skip)
-		for (int u = 0; u < int(cloud_msg->width); ++u, rgb += color_step, ++iter_x, ++iter_y, ++iter_z, ++iter_a, ++iter_r, ++iter_g, ++iter_b)
+		for (int u = 0; u < int(cloud_msg->width); ++u, rgb += color_step, ++iter_x, ++iter_y, ++iter_z, ++iter_r, ++iter_g, ++iter_b)
 		{
 			T depth = depth_row[u];
 
@@ -164,7 +180,6 @@ void ObjectCloudNode::convert(sensor_msgs::ImagePtr depth_msg,
 			}
 
 			// Fill in color
-			*iter_a = 255;
 			*iter_r = rgb[red_offset];
 			*iter_g = rgb[green_offset];
 			*iter_b = rgb[blue_offset];
@@ -184,38 +199,56 @@ vector<T> ObjectCloudNode::set_diff(vector<T> v1, vector<T> v2)
  */
 void ObjectCloudNode::mapDataCb(const rtabmap_ros::MapDataPtr mapDataPtr)
 {
+	pthread_mutex_lock(&mapData_mutex);
 	currKfIDs.clear();
+	cout<<"Curr Nodes: ";
 	for(int i=0;i<mapDataPtr->nodes.size();i++)
 	{
 		cout<<mapDataPtr->nodes[i].id<<" ";
 		currKfIDs.push_back(mapDataPtr->nodes[i].id);
 	}
 	cout<<endl;
-/*
-	vector<long unsigned int> kfsToRemove = set_diff<long unsigned int>(prevKfIDs, currKfIDs);
+
+	worldCloud.data.clear();
+	worldCloud.data = vector<uint8_t>();
+	worldCloud.height = 0;
+	/*vector<long unsigned int> kfsToRemove = set_diff<long unsigned int>(prevKfIDs, currKfIDs);
 	for(int i=0;i<kfsToRemove.size();i++)
-		kfObjectPoints.erase(kfsToRemove[i]);
-*/
+		kfObjectPoints.erase(kfsToRemove[i]);*/
+	vector<long unsigned int> kfsToAdd = set_diff<long unsigned int>(currKfIDs, prevKfIDs);
+	prevKfIDs = vector<long unsigned int>(currKfIDs);
 	//objectCloud.points.clear();
-	//for(int i=0;i<mapDataPtr->nodes.size();i++)
+	for(int i=mapDataPtr->nodes.size() - 1;i>0;i--)
 	{
-		/*it = kfObjectPoints.find(mapDataPtr->nodes[i].id);
-		if(it != kfObjectPoints.end())
-			objectCloud.points.insert(objectCloud.points.end(), it->second.points.begin(), it->second.points.end());
-		else*/
+		cout<<"finding "<<mapDataPtr->nodes[i].id<<endl;
+		it = kfObjectPoints.find(mapDataPtr->nodes[i].id);
+		if(it == kfObjectPoints.end())
 		{
+			cout<<mapDataPtr->nodes[i].id<<" not found"<<endl;
 			darknet_ros::ImageDetection obj;
 			cv_bridge::CvImagePtr rgbPtr = boost::make_shared<cv_bridge::CvImage>();
 			cv_bridge::CvImagePtr depthPtr = boost::make_shared<cv_bridge::CvImage>();
-			rgbPtr->image = rtabmap::uncompressImage(mapDataPtr->nodes.back().image);
-			cout<<rgbPtr->image.type()<<endl;
+			cout<<"uncompressing rgb"<<endl;
+			rgbPtr->image = rtabmap::uncompressImage(mapDataPtr->nodes[i].image);
+			if(rgbPtr->image.empty())
+			{	
+				cout<<"EMPTY RGB IMAGE"<<endl;
+				continue;
+			}
 			rgbPtr->encoding = sensor_msgs::image_encodings::BGR8;
-			depthPtr->image = rtabmap::uncompressImage(mapDataPtr->nodes.back().depth);
+			cout<<"uncompressing depth"<<endl;
+			depthPtr->image = rtabmap::uncompressImage(mapDataPtr->nodes[i].depth);
+			if(depthPtr->image.empty())
+			{
+				cout<<"EMPTY DEPTH IMAGE"<<endl;
+				continue;
+			}
 			depthPtr->encoding = depthPtr->image.empty()?"":depthPtr->image.type() == CV_32FC1?sensor_msgs::image_encodings::TYPE_32FC1:sensor_msgs::image_encodings::TYPE_16UC1;
+			cout<<"requesting srv"<<endl;
 			obj.request.msg = *(rgbPtr->toImageMsg());
 			imageDetectionClient.call(obj);
-			
-			sensor_msgs::PointCloud2::Ptr cloud_msg(new sensor_msgs::PointCloud2());
+			cout<<"got objects"<<endl;
+			/*sensor_msgs::PointCloud2::Ptr cloud_msg(new sensor_msgs::PointCloud2());
 			cloud_msg->header = depthPtr->toImageMsg()->header;
 			cloud_msg->header.frame_id = "camera_depth_optical_frame";
 			cloud_msg->height = depthPtr->toImageMsg()->height;
@@ -225,23 +258,47 @@ void ObjectCloudNode::mapDataCb(const rtabmap_ros::MapDataPtr mapDataPtr)
 
 			sensor_msgs::PointCloud2Modifier pcd_modifier(*cloud_msg);
 			pcd_modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
-
+			cout<<"made cloud_msg"<<endl;
 			if (depthPtr->toImageMsg()->encoding == sensor_msgs::image_encodings::TYPE_16UC1)
 				convert<uint16_t>(depthPtr->toImageMsg(),rgbPtr->toImageMsg(), cloud_msg);
 			else if (depthPtr->toImageMsg()->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
 				convert<float>(depthPtr->toImageMsg(),rgbPtr->toImageMsg(), cloud_msg);
-
-			pcl::PointCloud<pcl::PointXYZRGB> pc;
+			cout<<"converted images to PCD"<<endl;*/
+			/*pcl::PointCloud<pcl::PointXYZRGB> pc;
 			pcl::fromROSMsg<pcl::PointXYZRGB>(*cloud_msg, pc);
-			cout<<pc.height<<" "<<pc.width<<" "<<pc.points.size()<<endl;
-			pcl::PointCloud<pcl::PointXYZRGB> result = this->detectedImage(mapDataPtr->nodes.back().pose, obj.response.objects, pc);
-			cout<<result.height<<" "<<result.width<<" "<<result.points.size()<<endl;
+			cout<<pc.height<<" "<<pc.width<<" "<<pc.points.size()<<endl;*/
+			//sensor_msgs::PointCloud2 result = this->detectedImage(mapDataPtr->nodes.back().pose, obj.response.objects, *cloud_msg);
+			geometry_msgs::Pose pose;
+			memcpy(&(pose.position),&(mapDataPtr->nodes[i].localTransform[0].translation),3*sizeof(float));
+			pose.orientation = mapDataPtr->nodes[i].localTransform[0].rotation;
+			sensor_msgs::PointCloud2 result = detectedImage(obj.response.objects, *(depthPtr->toImageMsg()), *(rgbPtr->toImageMsg()), mapDataPtr->nodes[i].pose);
+			cout<<"PCD added "<<mapDataPtr->nodes[i].id<<endl;
+			kfObjectPoints[mapDataPtr->nodes[i].id] = result;
+			cout<<result.height<<" "<<result.width<<endl;
 			//kfObjectPoints[mapDataPtr->nodes[i].id] = result;
-			objectCloud.points.insert(objectCloud.points.end(), result.points.begin(), result.points.end());
+			//objectCloud.points.insert(objectCloud.points.end(), result.points.begin(), result.points.end());
+			
 		}
+		if(!worldCloud.data.empty())
+		{
+			worldCloud.data.insert(worldCloud.data.end(), kfObjectPoints[mapDataPtr->nodes[i].id].data.begin(), kfObjectPoints[mapDataPtr->nodes[i].id].data.end());
+			cout<<"ADDED TO END"<<endl;
+		}
+		else
+		{
+			worldCloud.data = kfObjectPoints[mapDataPtr->nodes[i].id].data;
+			cout<<"ADDED TO EMPTY"<<endl;
+		}
+		worldCloud.height += kfObjectPoints[mapDataPtr->nodes[i].id].height * kfObjectPoints[mapDataPtr->nodes[i].id].width;
+		worldCloud.row_step = worldCloud.point_step * worldCloud.height;
+		cout<<"PCD added "<<kfObjectPoints[mapDataPtr->nodes[i].id].height * kfObjectPoints[mapDataPtr->nodes[i].id].width<<endl;
+		//objectWorldCloud_pub.publish(kfObjectPoints[mapDataPtr->nodes[i].id]);
 	}
-	objectCloud.height = objectCloud.points.size();
-	pcl::toPCLPointCloud2(objectCloud, objectCloud2);
+	/*cout<<"PCD publishing"<<endl;
+	for(int i=0; i<mapDataPtr->nodes.size();i++)
+		*/
+	/*objectCloud.height = objectCloud.points.size();
+	pcl::toPCLPointCloud2(objectCloud, objectCloud2);*/
 	/*pcl::VoxelGrid<pcl::PCLPointCloud2> sor;
 	sor.setInputCloud(boost::make_shared<const pcl::PCLPointCloud2>(objectCloud2));
 	sor.setLeafSize(0.05f, 0.05f, 0.05f);
@@ -251,14 +308,21 @@ void ObjectCloudNode::mapDataCb(const rtabmap_ros::MapDataPtr mapDataPtr)
 	objectCloud.height = objectCloud.points.size();*/
 	/*sensor_msgs::PointCloud2 pc;
 	pcl::toROSMsg(objectCloud, pc);*/
-	
-	objectCloud2.header.seq++;
-	objectCloud2.header.frame_id = "map";
+	cout<<"incrementing seq"<<endl;
+	worldCloud.header.seq++;
+	cout<<"setting stamp"<<endl;
+	worldCloud.header.stamp = ros::Time::now();
+	cout<<"PCD publishing"<<endl;
+	objectWorldCloud_pub.publish(worldCloud);	
+	cout<<"PCD published"<<endl;
+	/*objectCloud2.header.seq++;
+	objectCloud2.header.frame_id = WORLD_FRAME;
 	pcl_conversions::toPCL(ros::Time::now(), objectCloud2.header.stamp);
 
 	objectWorldCloud_pub.publish(objectCloud2);
 	cout<<objectCloud2.height * objectCloud2.width<<endl;
-	cout<<objectCloud.points.size()<<endl;
+	cout<<objectCloud.points.size()<<endl;*/
+	pthread_mutex_unlock(&mapData_mutex);
 }
 
 /**
@@ -278,21 +342,6 @@ void ObjectCloudNode::depthImgCb(const sensor_msgs::ImagePtr depthImgPtr)
 {
 	pthread_mutex_lock(&depthImg_mutex);
 	depthImg = *depthImgPtr;
-	
-	/*pcl::PointCloud<pcl::PointXYZRGB> cloud = pcl::PointCloud<pcl::PointXYZRGB>(depthImg.width, depthImg.height, pcl::PointXYZRGB());
-	cloud.header.frame_id = "map";
-	cloud.height = depthImg.height;
-	cloud.width = depthImg.width
-	for(int i=0;i<depthImg.height;i++)
-		for(int j=0;j<depthImg.width;j++)
-		{
-			pcl::PointXYZRGB p;
-			p.z = 0;
-			p.x = cameraInfo.K[2] + cameraInfo.K[0]*p.x/p.z;
-			p.y = cameraInfo.K[5] + cameraInfo.K[4]*p.y/p.z;
-			
-			cloud.points.append(p);
-		}*/
 	pthread_mutex_unlock(&depthImg_mutex);
 }
 
@@ -313,7 +362,7 @@ void ObjectCloudNode::pointCloudCb(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr&
 {
 	pthread_mutex_lock(&pointCloud_mutex);
 	pixelCloud = *cloud;
-	
+	pcl::toROSMsg(pixelCloud, currCloud);
 	/*pcl::PCLPointCloud2::Ptr cloud_filtered(new pcl::PCLPointCloud2 ());
 	pcl::VoxelGrid<pcl::PCLPointCloud2> sor;
 	sor.setInputCloud(cloud);
@@ -336,163 +385,121 @@ void ObjectCloudNode::cameraInfoCb(const sensor_msgs::CameraInfoPtr cameraInfoPt
 
 void ObjectCloudNode::detectionWindowCb(const darknet_ros::DetectedObjectsPtr objectsPtr)
 {
-	//PcII result = this->detectedImage(rgbImg, depthImg , visualOdomPtr->pose.pose, *objectsPtr);
-	//pcl::PointCloud<pcl::PointXYZRGB> cloud = this->detectedImage(visualOdomPtr->pose.pose, *objectsPtr, pixelCloud);
-	//cout<<cloud.points.size()<<" Points found in current image"<<endl;
-	/*sensor_msgs::PointCloud2 pc;
-	pcl::toROSMsg(cloud, pc);
-	pc.header.frame_id = "map";
-	pc.header.stamp = ros::Time::now();
-	objectCloud_pub.publish(pc);*/
-
-	//sensor_msgs::PointCloud2 pc;
-	/*pcl::toROSMsg(objectCloud, pc);
-	pc.header.frame_id = "map";
-	pc.header.stamp = ros::Time::now();
-	objectWorldCloud_pub.publish(pc);*/
-	objectWorldCloud_pub.publish(objectCloud2)
-;	/*objectDepth_pub.publish(get<1>(result));
-	objectImg_pub.publish(get<2>(result));		*/
+	pthread_mutex_lock(&objects_mutex);
+	objectWorldCloud_pub.publish(detectedImage(*objectsPtr, depthImg, rgbImg, visualOdomPtr->pose.pose));
+	pthread_mutex_unlock(&objects_mutex);
 }
 
-pcl::PointCloud<pcl::PointXYZRGB> ObjectCloudNode::detectedImage(geometry_msgs::Pose pose, darknet_ros::DetectedObjects detections, pcl::PointCloud<pcl::PointXYZRGB> points)	
+sensor_msgs::PointCloud2::Ptr ObjectCloudNode::detectedImage(darknet_ros::DetectedObjects detections, sensor_msgs::Image depth, sensor_msgs::Image rgb)
 {
 	try 
 	{
-		tf::StampedTransform worldTF;
-		tf::poseMsgToTF(pose, worldTF);
-		float rc00,rc01,rc02,rc03,rc10,rc11,rc12,rc13,rc20,rc21,rc22,rc23; //transform matrix values
+		cv_bridge::CvImagePtr depthPtr_ = cv_bridge::toCvCopy(depth, sensor_msgs::image_encodings::TYPE_16UC1 );
+		cv_bridge::CvImagePtr rgbPtr_ = cv_bridge::toCvCopy(rgb, sensor_msgs::image_encodings::BGR8 );
 
-		rc00 = worldTF.getBasis()[0][0];  rc01 = worldTF.getBasis()[0][1];
-		rc02 = worldTF.getBasis()[0][2];  rc03 = worldTF.getOrigin()[0];
-		rc10 = worldTF.getBasis()[1][0];  rc11 = worldTF.getBasis()[1][1];
-		rc12 = worldTF.getBasis()[1][2];  rc13 = worldTF.getOrigin()[1];
-		rc20 = worldTF.getBasis()[2][0];  rc21 = worldTF.getBasis()[2][1];
-		rc22 = worldTF.getBasis()[2][2];  rc23 = worldTF.getOrigin()[2];
+		cv::Mat depthTarget(depthPtr_->image.size(), depthPtr_->image.type()),
+				rgbTarget(rgbPtr_->image.size(), rgbPtr_->image.type()); 
+
+		depthTarget = cv::Scalar(0);
+		rgbTarget = cv::Scalar(0,0,0);
 		
-		pcl::PointCloud<pcl::PointXYZRGB> cloud;
-		cloud.width = 1;
-
-		float minDepth=255, maxDepth=0, meanDepth = 0;
-		cout<<detections.objects.size()<<" Objects found"<<endl;
 		for(int i=0;i<detections.objects.size();i++)
 		{
-			float xc = 0, yc = 0, zc = 0;
 			if((!detections.objects[i].type.compare("chair") or !detections.objects[i].type.compare("table")) )
 				//and detections.objects[i].prob>0.4)	
 			{
 				darknet_ros::ObjectInfo obj = detections.objects[i];
-				//cout<<detections.objects[i].type<<" found"<<endl;
-				//cout<<points.width<<" "<<points.height<<endl;
 				//keeping bounding box within image dimensions
-				/*if(obj.tl_x+obj.width >= minWidth)
-					obj.width = minWidth-obj.tl_x;
-				if(obj.tl_y+obj.height >= minHeight)
-					obj.height = minHeight-obj.tl_y;*/
-				//cout<<"cropped height and width"<<endl;
-			
-				//getting min and max depth in bounding box and calculating mean depth
-				for(int j=obj.tl_x;j<obj.tl_x+obj.width;j+=2)
-					for(int k=obj.tl_y;k<obj.tl_y+obj.height;k+=2)
-					{
-						if(points.points[points.width*k + j].z < minDepth)
-							minDepth = points.points[points.width*k + j].z;
-						if(points.points[points.width*k + j].z > maxDepth)
-							maxDepth = points.points[points.width*k + j].z;
-					}
-			
-				meanDepth = (minDepth + maxDepth)/2.0;
-				//cout<<"got mean depth "<<meanDepth<<" "<<maxDepth<<endl;
+				if(obj.tl_x+obj.width >= rgb.width)
+					obj.width = rgb.width-obj.tl_x;
+				if(obj.tl_y+obj.height >= rgb.height)
+					obj.height = rgb.height-obj.tl_y;
 
-				//storing only those points which are closer than mean depth
-				for(int j=obj.tl_x;j<obj.tl_x+obj.width;j++)
-					for(int k=obj.tl_y;k<obj.tl_y+obj.height;k++)
-						if (points.points[points.width*k + j].z < meanDepth)
-						{
-							pcl::PointXYZRGB p, q = points.points[points.width*k + j];
-							p.x = rc00*q.z - rc01*q.x - rc02*q.y + rc03;
-							p.y = rc10*q.z - rc11*q.x - rc12*q.y + rc13;
-							p.z = rc20*q.z - rc21*q.x - rc22*q.y + rc23;
-							p.r = q.r;
-							p.g = q.g;
-							p.b = q.b;
-							xc += p.x; yc += p.y; zc += p.z;
-							cloud.points.push_back(p);
-						}
-				//cout<<"Stored "<<cloud.points.size()<<" points"<<endl;
-				
+				cv::Mat subImage = depthTarget(cv::Rect(obj.tl_x, obj.tl_y, obj.width, obj.height));
+				depthPtr_->image(cv::Rect(obj.tl_x, obj.tl_y, obj.width, obj.height)).copyTo(subImage);
 
+				subImage = rgbTarget(cv::Rect(obj.tl_x, obj.tl_y, obj.width, obj.height));
+				rgbPtr_->image(cv::Rect(obj.tl_x, obj.tl_y, obj.width, obj.height)).copyTo(subImage);
 			}
-			/*if(cloud.points.size()==0)
-				continue;
-			xc /= cloud.points.size(); yc /= cloud.points.size(); zc /= cloud.points.size();
-			
-			//cout<<xc<<" "<<yc<<" "<<zc<<endl;
-			if(xc==0 and yc==0 and zc==0)
-				continue;
-			else if(!table_pos.size())
-			{
-				table_pos.push_back(vector<uchar>());
-				table_pos.back().push_back(xc);
-				table_pos.back().push_back(yc);
-				table_pos.back().push_back(zc);
-			}
-			else
-			{
-				bool new_table = true;
-				float minDist = 1,dist;
-				//cout<<"ELSE"<<endl;
-				for(int i=0;i<table_pos.size();i++)
-				{
-					dist =  (table_pos[i][0]-xc)*(table_pos[i][0]-xc) + 
-							(table_pos[i][1]-yc)*(table_pos[i][1]-yc) + 
-							(table_pos[i][2]-zc)*(table_pos[i][2]-zc);
-					//cout<< boolalpha <<dist<<" "<<(dist < minDist)<<endl;
-					if(dist < minDist)
-					{
-						new_table = false;
-						break;
-					}
-				}
-				if(new_table)
-				{
-					table_pos.push_back(vector<uchar>());
-					table_pos.back().push_back(xc);
-					table_pos.back().push_back(yc);
-					table_pos.back().push_back(zc);
-				}
-			}*/
 		}
+		sensor_msgs::PointCloud2::Ptr objPC(new sensor_msgs::PointCloud2());
+		objPC->header = depthPtr_->toImageMsg()->header;
+		objPC->height = depthPtr_->toImageMsg()->height;
+		objPC->width	= depthPtr_->toImageMsg()->width;
+		objPC->is_dense = false;
+		objPC->is_bigendian = false;
+
+		sensor_msgs::ImagePtr objDepthImg = cv_bridge::CvImage(std_msgs::Header(), "mono16", depthTarget).toImageMsg();
+		objDepthImg->header.frame_id = "camera_rgb_optical_frame";
+		objDepthImg->header.stamp = ros::Time::now();
 		
-		cloud.height = cloud.points.size();
-		return cloud;
+		sensor_msgs::ImagePtr objRGBImg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", rgbTarget).toImageMsg();
+		objRGBImg->header.frame_id = "camera_rgb_optical_frame";
+		objRGBImg->header.stamp = ros::Time::now();
+
+		sensor_msgs::PointCloud2Modifier pcd_modifier(*objPC);
+		pcd_modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
+		
+		if (depthPtr_->toImageMsg()->encoding == sensor_msgs::image_encodings::TYPE_16UC1)
+			convert<uint16_t>(objDepthImg, objRGBImg, objPC);
+		else if (depthPtr_->toImageMsg()->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
+			convert<float>(objDepthImg, objRGBImg, objPC);
+		
+		objPC->header.frame_id = "camera_rgb_optical_frame";
+		objPC->header.stamp = ros::Time::now();
+
+			/*sensor_msgs::ImagePtr msg_1 = cv_bridge::CvImage(std_msgs::Header(), "mono16", depthTarget).toImageMsg();
+			msg_1->header.frame_id = "camera_rgb_optical_frame";
+			msg_1->header.stamp = ros::Time::now();
+			objectDepth_pub.publish(msg_1);
+
+			msg_1 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", rgbTarget).toImageMsg();
+			objectImg_pub.publish(msg_1);*/
+		
+		return objPC;
 		
 	} catch (exception &e)
 	{
-		//cout<<e.what()<<endl;
-		return pixelCloud;
+		cout<<e.what()<<endl;
+		return sensor_msgs::PointCloud2Ptr();
 	}
+}
 
-/*
+sensor_msgs::PointCloud2 ObjectCloudNode::detectedImage(darknet_ros::DetectedObjects detections, sensor_msgs::Image depth, sensor_msgs::Image rgb, geometry_msgs::Pose pose)
+{
+	cout<<"getting in camera frame"<<endl;
+	sensor_msgs::PointCloud2::Ptr result = detectedImage(detections, depth, rgb);
+	/*if(result->height*result->width==0)
+		return *result;*/
+	tf::StampedTransform worldTF;
+	cout<<"getting TF"<<endl;
+	tf::poseMsgToTF(pose, worldTF);	
 
-	unsigned char* dat = &(objectCloud2.data[0]);
-	unsigned int n=0;
-	
-	for(std::vector<MapPoint::Ptr>::iterator it=mpMap->vpPoints.begin(); it!=mpMap->vpPoints.end(); ++it,++n)
-	{
-	  if(n>objectCloud2.width-1) break;
-	  MapPoint& p = *(*it);
-
-	  Vector<3,float> fvec = p.v3WorldPos,pvec;
-	  uint32_t colorlvl = 0xff<<((3-p.nSourceLevel)*8);
-	  uint32_t lvl = p.nSourceLevel;
-	  uint32_t KF = p.pPatchSourceKF->ID;
-
-	  memcpy(dat, &(fvec),3*sizeof(float));
-	  memcpy(dat+3*sizeof(uint32_t),&colorlvl,sizeof(uint32_t));
-	  memcpy(dat+4*sizeof(uint32_t),&lvl,sizeof(uint32_t));
-	  memcpy(dat+5*sizeof(uint32_t),&KF,sizeof(uint32_t));
-	  dat+=objectCloud2.point_step;
-
-	}*/
+	float rc00,rc01,rc02,rc03,rc10,rc11,rc12,rc13,rc20,rc21,rc22,rc23; //transform matrix values
+	cout<<"getting tf coeffs"<<endl;
+	rc00 = worldTF.getBasis()[0][0];  rc01 = worldTF.getBasis()[0][1];
+	rc02 = worldTF.getBasis()[0][2];  rc03 = worldTF.getOrigin()[0];
+	rc10 = worldTF.getBasis()[1][0];  rc11 = worldTF.getBasis()[1][1];
+	rc12 = worldTF.getBasis()[1][2];  rc13 = worldTF.getOrigin()[1];
+	rc20 = worldTF.getBasis()[2][0];  rc21 = worldTF.getBasis()[2][1];
+	rc22 = worldTF.getBasis()[2][2];  rc23 = worldTF.getOrigin()[2];
+	cout<<"initializing iterators"<<endl;
+	sensor_msgs::PointCloud2Iterator<float> iter_x(*result, "x");
+	sensor_msgs::PointCloud2Iterator<float> iter_y(*result, "y");
+	sensor_msgs::PointCloud2Iterator<float> iter_z(*result, "z");
+	cout<<"starting iterations"<<endl;
+	for(int v = 0; v < int(result->height); ++v)
+		for(int u = 0; u < int(result->width); ++u, ++iter_x, ++iter_y, ++iter_z)
+		{
+			float x = *iter_x;
+			float y = *iter_y;
+			float z = *iter_z;
+		
+			*iter_x = rc00*z - rc01*x - rc02*y + rc03;
+			*iter_y = rc10*z - rc11*x - rc12*y + rc13;
+			*iter_z = rc20*z - rc21*x - rc22*y + rc23;
+		}
+	cout<<"finished iterations"<<endl;
+	result->header.frame_id = WORLD_FRAME;
+	return *result;
 }

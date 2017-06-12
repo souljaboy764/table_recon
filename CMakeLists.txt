@@ -50,11 +50,11 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
 )
 
-#set(CMAKE_CXX_FLAGS "-std=c++11")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O1 -g")
+set(CMAKE_CXX_FLAGS "-std=c++11")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
 
 ## Declare a C++ executable
-add_executable(object_cloud_node src/main_object_cloud.cc src/ObjectCloudNode.cpp)
+add_executable(object_cloud_node src/main_object_cloud.cc src/System.cpp src/Helper.cpp)
 
 ## Add cmake target dependencies of the executable
 ## same as for the library above

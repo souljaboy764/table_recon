@@ -10,13 +10,10 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
   std_msgs
-  pcl_ros
-  rtabmap_ros
 )
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
-find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 
 
@@ -46,7 +43,6 @@ catkin_package(
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
 )
 
@@ -63,6 +59,5 @@ add_dependencies(object_cloud_node DEPS ${${PROJECT_NAME}_EXPORTED_TARGETS} ${ca
 ## Specify libraries to link a library or executable target against
 target_link_libraries(object_cloud_node
    ${catkin_LIBRARIES}
-   ${PCL_LIBRARIES}
    ${OpenCV_LIBRARIES}
 )
